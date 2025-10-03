@@ -9,8 +9,8 @@ import random
 import string
 
 # --- تنظیمات اولیه ---
-TOKEN = 'enter your bot token'  # توکن ربات
-ADMIN_ID = 123456789  # آیدی عددی ادمین اصلی 
+TOKEN = '8342748520:AAHaLxjLBY4tZGD1nYDcu_PJDbc34zFB4Xs'  # توکن ربات
+ADMIN_ID = 5959954413  # آیدی عددی ادمین اصلی 
 DB_FILE = 'bot_data.db'
 MAX_MESSAGE_LENGTH = 4096
 
