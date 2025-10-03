@@ -7,6 +7,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 import random
 import string
+import os
 
 # --- تنظیمات اولیه ---
 TOKEN = '8342748520:AAHaLxjLBY4tZGD1nYDcu_PJDbc34zFB4Xs'  # توکن ربات
