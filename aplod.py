@@ -1,34 +1,18 @@
 import telebot
 from telebot import types
+from database_adapter import *
 import logging
 import time
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta
 import random
 import string
-import os
-from dotenv import load_dotenv
-
-# بارگذاری متغیرهای محیطی
-load_dotenv()
 
 # --- تنظیمات اولیه ---
-TOKEN = os.getenv('TELEGRAM_TOKEN', '8342748520:AAHaLxjLBY4tZGD1nYDcu_PJDbc34zFB4Xs')
-ADMIN_ID = int(os.getenv('ADMIN_ID', 5959954413))
+TOKEN = 'enter your bot token'  # توکن ربات
+ADMIN_ID = 123456789  # آیدی عددی ادمین اصلی 
+DB_FILE = 'bot_data.db'
 MAX_MESSAGE_LENGTH = 4096
-
-# ایمپورت دیتابیس جدید PostgreSQL
-from database import (
-    get_db_connection, create_tables, get_user_language, update_user_language,
-    add_user, update_user_activity, is_user_banned, ban_user, unban_user,
-    is_admin, get_all_admins, add_admin, remove_admin, get_admin_count,
-    get_settings, create_or_get_settings, update_setting,
-    get_custom_text, update_custom_text,
-    save_file_info, get_file_info, update_file_download_count, delete_file_info,
-    search_files, get_total_files,
-    save_album_info, get_album_info, update_album_download_count, delete_album_info, get_total_albums,
-    get_all_users, get_total_users, get_active_users_today, get_new_users_count
-)
 
 # --- تنظیمات لاگ ---
 logging.basicConfig(
@@ -166,6 +150,7 @@ LANGUAGES = {
         'bot_not_admin_in_channel': '❌ ربات در کانال/گروه {channel_title} ادمین نیست یا دسترسی لازم را ندارد. لطفاً ربات را ادمین کنید و دسترسی‌های لازم (مثل افزودن عضو) را بدهید.',
     },
     'en': {
+        # ... (English translations as before, omitted for brevity) ...
         'welcome_admin': 'Welcome to the bot admin panel 👨‍💻',
         'welcome_user': '👋 Hello! Welcome to our powerful bot! 😊',
         'file_not_found': '❌ File not found. It may have been deleted or the ID is incorrect. 😕',
@@ -186,8 +171,301 @@ LANGUAGES = {
     }
 }
 
+# --- توابع دیتابیس (بدون تغییر) ---
+def get_db_connection():
+    return sqlite3.connect(DB_FILE, check_same_thread=False, isolation_level=None)
+
+def create_tables():
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    chat_id INTEGER PRIMARY KEY,
+                    forward_lock INTEGER DEFAULT 1,
+                    auto_delete_time INTEGER DEFAULT 30,
+                    allow_uploads INTEGER DEFAULT 0,
+                    force_view_reaction_enabled INTEGER DEFAULT 0,
+                    view_reaction_link TEXT,
+                    view_reaction_channel_id TEXT,
+                    welcome_message TEXT DEFAULT '👋 خوش آمدید، {user}! 😊',
+                    force_join_enabled INTEGER DEFAULT 1,
+                    force_join_link TEXT,
+                    force_join_channel_id TEXT
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    banned INTEGER DEFAULT 0,
+                    last_active TEXT,
+                    join_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                    language TEXT DEFAULT 'fa'
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bot_admins (
+                    user_id INTEGER PRIMARY KEY,
+                    added_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS files (
+                    file_id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    file_type TEXT,
+                    message_id INTEGER,
+                    chat_id INTEGER,
+                    download_count INTEGER DEFAULT 0,
+                    upload_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                    caption TEXT,
+                    original_filename TEXT
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS albums (
+                    album_id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    message_ids TEXT,
+                    chat_id INTEGER,
+                    download_count INTEGER DEFAULT 0,
+                    upload_date TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS custom_texts (
+                    key TEXT PRIMARY KEY,
+                    text TEXT
+                )
+            ''')
+            cursor.execute('INSERT OR IGNORE INTO bot_admins (user_id) VALUES (?)', (ADMIN_ID,))
+            conn.commit()
+        logger.info("دیتابیس و جداول با موفقیت ایجاد شد.")
+    except sqlite3.Error as e:
+        logger.error(f"خطا در دیتابیس: {e}")
+
+def get_user_language(user_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT language FROM users WHERE user_id=?', (user_id,))
+        row = cursor.fetchone()
+        return row[0] if row else 'fa'
+
+def update_user_language(user_id, lang_code):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET language=? WHERE user_id=?', (lang_code, user_id))
+        conn.commit()
+
+def get_settings(chat_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT chat_id, forward_lock, auto_delete_time, allow_uploads, force_view_reaction_enabled, view_reaction_link, view_reaction_channel_id, welcome_message, force_join_enabled, force_join_link, force_join_channel_id FROM settings WHERE chat_id=?', (chat_id,))
+        row = cursor.fetchone()
+        if row:
+            keys = ['chat_id', 'forward_lock', 'auto_delete_time', 'allow_uploads', 'force_view_reaction_enabled', 'view_reaction_link', 'view_reaction_channel_id', 'welcome_message', 'force_join_enabled', 'force_join_link', 'force_join_channel_id']
+            return dict(zip(keys, row))
+        return None
+
+def create_or_get_settings(chat_id):
+    settings = get_settings(chat_id)
+    if not settings:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('INSERT INTO settings (chat_id, allow_uploads, force_join_enabled) VALUES (?, 0, 1)', (chat_id,))
+            conn.commit()
+        return get_settings(chat_id)
+    return settings
+
+def update_setting(chat_id, key, value):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(f'UPDATE settings SET {key}=? WHERE chat_id=?', (value, chat_id))
+        conn.commit()
+
+def get_custom_text(key, lang_code='fa'):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT text FROM custom_texts WHERE key=?', (key,))
+        row = cursor.fetchone()
+        return row[0] if row else LANGUAGES.get(lang_code, LANGUAGES['fa']).get(key, f"Default text for {key} not found.")
+
+def update_custom_text(key, text):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR REPLACE INTO custom_texts (key, text) VALUES (?, ?)', (key, text))
+        conn.commit()
+
+def add_user(user_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR IGNORE INTO users (user_id, last_active) VALUES (?, ?)', (user_id, datetime.now().strftime('%Y-%m-%d')))
+        cursor.execute('UPDATE users SET last_active=? WHERE user_id=?', (datetime.now().strftime('%Y-%m-%d'), user_id))
+        conn.commit()
+
+def is_admin(user_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM bot_admins WHERE user_id=?', (user_id,))
+        return cursor.fetchone() is not None
+
+def get_all_admins():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM bot_admins')
+        return [row[0] for row in cursor.fetchall()]
+
+def add_admin(user_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('INSERT OR IGNORE INTO bot_admins (user_id) VALUES (?)', (user_id,))
+        conn.commit()
+
+def remove_admin(user_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM bot_admins WHERE user_id=?', (user_id,))
+        conn.commit()
+
+def get_all_users():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id FROM users')
+        return [row[0] for row in cursor.fetchall()]
+
+def get_admin_count():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM bot_admins')
+        return cursor.fetchone()[0]
+
+def get_total_users():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM users')
+        return cursor.fetchone()[0]
+
+def get_active_users_today():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        today = datetime.now().strftime('%Y-%m-%d')
+        cursor.execute('SELECT COUNT(DISTINCT user_id) FROM users WHERE last_active=?', (today,))
+        return cursor.fetchone()[0]
+
+def update_user_activity(user_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET last_active=? WHERE user_id=?', (datetime.now().strftime('%Y-%m-%d'), user_id))
+        conn.commit()
+
+def get_new_users_count(days=1):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        past_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        cursor.execute('SELECT COUNT(*) FROM users WHERE join_date >= ?', (past_date,))
+        return cursor.fetchone()[0]
+
+def get_total_files():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM files')
+        return cursor.fetchone()[0]
+
+def get_total_albums():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT COUNT(*) FROM albums')
+        return cursor.fetchone()[0]
+
+def get_file_info(file_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT file_type, message_id, chat_id, download_count, caption, original_filename FROM files WHERE file_id=?', (file_id,))
+        row = cursor.fetchone()
+        if row:
+            keys = ['file_type', 'message_id', 'chat_id', 'download_count', 'caption', 'original_filename']
+            return dict(zip(keys, row))
+        return None
+
+def update_file_download_count(file_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE files SET download_count = download_count + 1 WHERE file_id=?', (file_id,))
+        conn.commit()
+
+def save_file_info(file_id, user_id, file_type, message_id, chat_id, caption=None, original_filename=None):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO files (file_id, user_id, file_type, message_id, chat_id, caption, original_filename) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                       (file_id, user_id, file_type, message_id, chat_id, caption, original_filename))
+        conn.commit()
+
+def delete_file_info(file_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM files WHERE file_id=?', (file_id,))
+        conn.commit()
+
+def get_album_info(album_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT user_id, message_ids, chat_id, download_count FROM albums WHERE album_id=?', (album_id,))
+        row = cursor.fetchone()
+        if row:
+            keys = ['user_id', 'message_ids', 'chat_id', 'download_count']
+            return dict(zip(keys, row))
+        return None
+
+def update_album_download_count(album_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE albums SET download_count = download_count + 1 WHERE album_id=?', (album_id,))
+        conn.commit()
+
+def save_album_info(album_id, user_id, message_ids, chat_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO albums (album_id, user_id, message_ids, chat_id) VALUES (?, ?, ?, ?)',
+                       (album_id, user_id, message_ids, chat_id))
+        conn.commit()
+
+def delete_album_info(album_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM albums WHERE album_id=?', (album_id,))
+        conn.commit()
+
 def generate_unique_id(length=16):
     return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
+def is_user_banned(user_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT banned FROM users WHERE user_id=?', (user_id,))
+        row = cursor.fetchone()
+        return row and row[0] == 1
+
+def ban_user(user_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET banned=1 WHERE user_id=?', (user_id,))
+        conn.commit()
+
+def unban_user(user_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('UPDATE users SET banned=0 WHERE user_id=?', (user_id,))
+        conn.commit()
+
+def search_files(query):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        search_query = f"%{query}%"
+        cursor.execute(
+            'SELECT file_id, caption, original_filename, upload_date FROM files WHERE file_id LIKE ? OR caption LIKE ? OR original_filename LIKE ? ORDER BY upload_date DESC LIMIT 20',
+            (search_query, search_query, search_query)
+        )
+        return cursor.fetchall()
 
 def get_channel_id_from_link(link):
     link = link.strip()
@@ -229,6 +507,10 @@ def is_user_member(user_id, channel_id):
         logger.error(f"خطا در بررسی عضویت کاربر {user_id} در کانال {channel_id}: {e}")
         if "chat not found" in str(e).lower() or "bad request: chat not found" in str(e).lower():
             logger.warning(f"The specified channel/group '{channel_id}' was not found. Consider updating force join settings.")
+            # Optionally, disable the setting if channel is clearly invalid.
+            # update_setting(ADMIN_ID, 'force_join_enabled', 0)
+            # update_setting(ADMIN_ID, 'force_join_link', None)
+            # update_setting(ADMIN_ID, 'force_join_channel_id', None)
         elif "user not in chat" in str(e).lower():
             return False
         return False
@@ -236,7 +518,7 @@ def is_user_member(user_id, channel_id):
         logger.error(f"An unexpected error occurred while checking membership for {user_id} in {channel_id}: {e}")
         return False
 
-# --- توابع کیبورد ---
+# --- توابع کیبورد (بدون تغییر منطقی) ---
 def show_admin_main_menu(chat_id, lang):
     markup = types.ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     markup.add(
@@ -348,7 +630,7 @@ def show_language_selection_menu(chat_id, lang):
     )
     bot.send_message(chat_id, LANGUAGES[lang]['choose_language'], reply_markup=markup)
 
-# --- هندلرهای مبتنی بر وضعیت ---
+# --- هندلرهای مبتنی بر وضعیت (با استفاده از register_next_step_handler) ---
 def set_auto_delete_step1(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
@@ -377,6 +659,8 @@ def change_text_step1(message):
     user_id = message.from_user.id
     lang = get_user_language(user_id)
     show_change_text_menu(chat_id, lang)
+    # No next_step_handler here, as the next step is handled by specific text matchers
+    # within handle_all_messages or a dedicated @bot.message_handler for change_text_menu_* options.
 
 def change_text_step2(message, db_key):
     chat_id = message.chat.id
@@ -384,6 +668,7 @@ def change_text_step2(message, db_key):
     lang = get_user_language(user_id)
 
     bot.send_message(chat_id, LANGUAGES[lang]['change_text_menu_prompt_new'])
+    # Store the key in user_states for the next step
     user_states[chat_id] = {'state': 'awaiting_new_text_for_key', 'key': db_key}
     bot.register_next_step_handler(message, change_text_step3)
 
@@ -533,13 +818,13 @@ def set_force_join_link_step2(message):
             show_force_join_menu(chat_id, lang)
             return
 
-        if bot_member.status == 'administrator' and not bot_member.can_invite_users:
+        if bot_member.status == 'administrator' and not bot_member.can_invite_users: # For private groups, if bot should invite
             bot.send_message(chat_id, LANGUAGES[lang]['bot_not_admin_in_channel'].format(channel_title=channel_id))
             show_force_join_menu(chat_id, lang)
             return
 
         update_setting(chat_id, 'force_join_link', link)
-        update_setting(chat_id, 'force_join_channel_id', str(channel_id))
+        update_setting(chat_id, 'force_join_channel_id', str(channel_id)) # Store as string for flexibility
         bot.send_message(chat_id, LANGUAGES[lang]['force_join_link_success'])
     except telebot.apihelper.ApiTelegramException as e:
         error_message = str(e).lower()
@@ -587,7 +872,7 @@ def set_view_reaction_link_step2(message):
             return
 
         update_setting(chat_id, 'view_reaction_link', link)
-        update_setting(chat_id, 'view_reaction_channel_id', str(channel_id))
+        update_setting(chat_id, 'view_reaction_channel_id', str(channel_id)) # Store as string for flexibility
         bot.send_message(chat_id, LANGUAGES[lang]['view_reaction_link_success'])
     except telebot.apihelper.ApiTelegramException as e:
         error_message = str(e).lower()
@@ -692,6 +977,7 @@ def support_message_step2(message):
         bot.send_message(chat_id, "❌ ادمینی برای دریافت پیام شما پیدا نشد.")
     show_user_main_menu(chat_id, lang)
 
+
 # --- هندلرهای اصلی ---
 @bot.message_handler(commands=['start'])
 def start_command(message):
@@ -706,15 +992,15 @@ def start_command(message):
             return
 
         lang = get_user_language(user_id)
-        settings = create_or_get_settings(ADMIN_ID)
+        settings = create_or_get_settings(ADMIN_ID) # Use ADMIN_ID for settings as they are bot-wide
 
-        # Force Join Check
+        # Force Join Check - Placed here to restrict any bot usage if not a member
         if settings['force_join_enabled'] and settings['force_join_link'] and settings['force_join_channel_id']:
             if not is_user_member(user_id, settings['force_join_channel_id']):
                 markup = types.InlineKeyboardMarkup()
                 markup.add(types.InlineKeyboardButton(text="عضویت در کانال/گروه", url=settings['force_join_link']))
                 bot.send_message(chat_id, LANGUAGES[lang]['not_a_member'].format(link=settings['force_join_link']), reply_markup=markup)
-                return
+                return # Stop execution if user is not a member
 
         if message.text.startswith('/start '):
             param = message.text.split(' ')[1]
@@ -768,7 +1054,7 @@ def start_command(message):
                     bot.send_message(chat_id, LANGUAGES[lang]['upload_album_link'].format(bot_username=bot.get_me().username, album_id=param, seconds=seconds_text), reply_markup=markup)
 
                     if settings['auto_delete_time'] > 0:
-                        pass
+                        pass # Placeholder. Proper album message deletion requires tracking sent message IDs.
                 except Exception as e:
                     logger.error(f"خطا در ارسال آلبوم: {e}")
                     bot.send_message(chat_id, LANGUAGES[lang]['file_not_found'])
@@ -790,8 +1076,6 @@ def welcome_new_member(message):
     user_id = message.from_user.id
     lang = get_user_language(user_id)
     welcome_message = get_custom_text('welcome_message', lang)
-    if welcome_message is None:
-        welcome_message = LANGUAGES[lang]['welcome_user']
     for new_member in message.new_chat_members:
         if new_member.id == bot.get_me().id:
             logger.info(f"Bot joined chat {chat_id} ({message.chat.title})")
@@ -803,14 +1087,14 @@ def welcome_new_member(message):
 def handle_file_upload(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
-    settings = create_or_get_settings(ADMIN_ID)
+    settings = create_or_get_settings(ADMIN_ID) # Settings are global for the bot, use ADMIN_ID for retrieving them
     lang = get_user_language(user_id)
 
     if is_user_banned(user_id):
         bot.send_message(chat_id, LANGUAGES[lang]['banned'])
         return
 
-    # Check Force Join
+    # Check Force Join for all messages including file uploads
     if settings['force_join_enabled'] and settings['force_join_link'] and settings['force_join_channel_id']:
         if not is_user_member(user_id, settings['force_join_channel_id']):
             markup = types.InlineKeyboardMarkup()
@@ -822,7 +1106,7 @@ def handle_file_upload(message):
         bot.send_message(chat_id, "❌ شما اجازه آپلود فایل ندارید!")
         return
 
-    # Handle album files
+    # Handle album files if in album upload state
     if user_states.get(chat_id) == 'awaiting_album_files':
         if len(album_upload_data.get(chat_id, [])) >= 10:
             bot.send_message(chat_id, LANGUAGES[lang]['album_upload_limit_reached'])
@@ -850,6 +1134,7 @@ def handle_file_upload(message):
         file_info = message.audio
         original_filename = getattr(message.audio, 'file_name', f"audio_{file_info.file_id}.mp3")
     else:
+        # If it's not a supported file type, just ignore or send a message
         bot.send_message(chat_id, "فایل ارسالی پشتیبانی نمی‌شود. لطفا عکس، ویدئو، سند یا صدا ارسال کنید.")
         return
 
@@ -887,7 +1172,7 @@ def handle_menu_buttons(message):
         bot.send_message(chat_id, LANGUAGES[lang]['banned'])
         return
 
-    # Force Join Check
+    # Force Join Check - This will run for all messages *after* the initial /start check
     if settings['force_join_enabled'] and settings['force_join_link'] and settings['force_join_channel_id']:
         if not is_user_member(user_id, settings['force_join_channel_id']):
             markup = types.InlineKeyboardMarkup()
@@ -897,7 +1182,9 @@ def handle_menu_buttons(message):
 
     update_user_activity(user_id)
 
-    # Handle state-based inputs
+    # Handle state-based inputs (if any previous handler registered a next step)
+    # This block should typically be empty if using `register_next_step_handler` as it handles the next message directly.
+    # However, if some states transition without RNSH, they can be caught here.
     if chat_id in user_states:
         state_data = user_states.get(chat_id)
         if state_data == 'awaiting_album_files':
@@ -931,8 +1218,9 @@ def handle_menu_buttons(message):
                 bot.send_message(chat_id, LANGUAGES[lang]['album_upload_canceled'])
                 show_admin_main_menu(chat_id, lang)
                 return
+            # If it's not a button for album state, let it fall through for other handlers.
 
-    # Handle main menu navigation
+    # Handle main menu navigation - always check these first
     if message.text == LANGUAGES[lang]['back_to_main_menu']:
         if chat_id in user_states: del user_states[chat_id]
         if is_admin(user_id): show_admin_main_menu(chat_id, lang)
@@ -968,7 +1256,7 @@ def handle_menu_buttons(message):
         show_admin_main_menu(chat_id, lang)
         return
 
-    # User-specific commands
+    # User-specific commands (accessible to all)
     elif message.text == LANGUAGES[lang]['btn_bot_info']:
         bot.send_message(chat_id, "🤖 اطلاعات ربات: این ربات برای مدیریت فایل‌های شما و ارائه خدمات بهینه توسط تیم ما توسعه یافته است.")
     elif message.text == LANGUAGES[lang]['btn_report_problem']:
@@ -984,7 +1272,7 @@ def handle_menu_buttons(message):
             show_settings_menu(chat_id, lang)
         elif message.text == LANGUAGES[lang]['btn_upload_file']:
             bot.send_message(chat_id, "لطفاً فایل خود (عکس، ویدئو، سند یا صدا) را ارسال کنید.")
-            user_states[chat_id] = 'awaiting_file_upload'
+            user_states[chat_id] = 'awaiting_file_upload' # Set state for file handling
         elif message.text == LANGUAGES[lang]['btn_album_upload']:
             show_album_upload_menu(chat_id, lang)
             user_states[chat_id] = 'awaiting_album_files'
@@ -1001,8 +1289,8 @@ def handle_menu_buttons(message):
         elif message.text == LANGUAGES[lang]['btn_change_text']:
             change_text_step1(message)
         elif message.text == LANGUAGES[lang]['btn_forward_lock']:
-            new_status = not settings['forward_lock']
-            update_setting(ADMIN_ID, 'forward_lock', new_status)
+            new_status = 0 if settings['forward_lock'] else 1
+            update_setting(ADMIN_ID, 'forward_lock', new_status) # Update global settings for admin
             bot.send_message(chat_id, LANGUAGES[lang]['forward_lock_on'] if new_status else LANGUAGES[lang]['forward_lock_off'])
             show_settings_menu(chat_id, lang)
         elif message.text == LANGUAGES[lang]['btn_view_reaction_lock']:
@@ -1010,14 +1298,14 @@ def handle_menu_buttons(message):
         elif message.text == LANGUAGES[lang]['btn_force_join']:
             show_force_join_menu(chat_id, lang)
         elif message.text == LANGUAGES[lang]['force_join_toggle']:
-            new_status = not settings['force_join_enabled']
+            new_status = 0 if settings['force_join_enabled'] else 1
             update_setting(ADMIN_ID, 'force_join_enabled', new_status)
             bot.send_message(chat_id, LANGUAGES[lang]['force_join_on'] if new_status else LANGUAGES[lang]['force_join_off'])
             show_force_join_menu(chat_id, lang)
         elif message.text == LANGUAGES[lang]['force_join_set_link']:
             set_force_join_link_step1(message)
         elif message.text == LANGUAGES[lang]['view_reaction_menu_toggle']:
-            new_status = not settings['force_view_reaction_enabled']
+            new_status = 0 if settings['force_view_reaction_enabled'] else 1
             update_setting(ADMIN_ID, 'force_view_reaction_enabled', new_status)
             bot.send_message(chat_id, LANGUAGES[lang]['view_reaction_on'] if new_status else LANGUAGES[lang]['view_reaction_off'])
             show_view_reaction_menu(chat_id, lang)
@@ -1032,20 +1320,23 @@ def handle_menu_buttons(message):
         elif message.text == '🗑️ حذف ادمین':
             remove_admin_step1(message)
         elif message.text == '📂 مشاهده لیست فایل‌ها':
-            results = search_files('')
-            if results:
-                file_list = []
-                for file_id, caption, original_filename, upload_date in results:
-                    item_text = f"ID: `{file_id}`\n"
-                    if original_filename:
-                        item_text += f"نام فایل: `{original_filename}`\n"
-                    if caption:
-                        item_text += f"کپشن: `{caption}`\n"
-                    item_text += f"تاریخ آپلود: {upload_date}\n"
-                    file_list.append(item_text)
-                bot.send_message(chat_id, LANGUAGES[lang]['file_list'].format(list='\n---\n'.join(file_list)), parse_mode='Markdown')
-            else:
-                bot.send_message(chat_id, LANGUAGES[lang]['no_files'])
+            with get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT file_id, caption, original_filename, upload_date FROM files ORDER BY upload_date DESC LIMIT 20')
+                files = cursor.fetchall()
+                if files:
+                    file_list = []
+                    for file_id, caption, original_filename, upload_date in files:
+                        item_text = f"ID: `{file_id}`\n"
+                        if original_filename:
+                            item_text += f"نام فایل: `{original_filename}`\n"
+                        if caption:
+                            item_text += f"کپشن: `{caption}`\n"
+                        item_text += f"تاریخ آپلود: {upload_date}\n"
+                        file_list.append(item_text)
+                    bot.send_message(chat_id, LANGUAGES[lang]['file_list'].format(list='\n---\n'.join(file_list)), parse_mode='Markdown')
+                else:
+                    bot.send_message(chat_id, LANGUAGES[lang]['no_files'])
             show_file_management_menu(chat_id, lang)
         elif message.text == '🗑️ حذف فایل':
             delete_file_step1(message)
@@ -1060,8 +1351,10 @@ def handle_menu_buttons(message):
         elif message.text == LANGUAGES[lang]['change_text_menu_view_reaction']:
             change_text_step2(message, 'view_reaction_settings_menu')
         else:
+            # If nothing matched, and it's an admin, show admin menu
             show_admin_main_menu(chat_id, lang)
     else:
+        # If no specific command or state is matched for non-admins
         show_user_main_menu(chat_id, lang)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('set_lang_'))
@@ -1086,3 +1379,4 @@ if __name__ == '__main__':
     create_tables()
     logger.info("ربات با موفقیت راه‌اندازی شد.")
     bot.infinity_polling()
+
