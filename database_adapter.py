@@ -1,8 +1,16 @@
 import os
-import psycopg2
 import logging
-from urllib.parse import urlparse
 from datetime import datetime, timedelta
+import random
+import string
+
+try:
+    import pg8000
+    from pg8000.native import Connection, DatabaseError
+    PG8000_AVAILABLE = True
+except ImportError:
+    PG8000_AVAILABLE = False
+    logging.error("pg8000 not available, using SQLite fallback")
 
 logger = logging.getLogger(__name__)
 
@@ -14,50 +22,54 @@ class PostgresDB:
         self._connect()
     
     def _connect(self):
+        """اتصال به PostgreSQL با pg8000"""
         try:
-            result = urlparse(DATABASE_URL)
-            database = result.path[1:]
-            user = result.username
-            password = result.password
-            host = result.hostname
-            port = result.port
-            
-            self.conn = psycopg2.connect(
-                database=database,
-                user=user,
-                password=password,
-                host=host,
-                port=port,
-                sslmode='require'
-            )
-            logger.info("✅ Connected to PostgreSQL Neon successfully")
+            if DATABASE_URL and PG8000_AVAILABLE:
+                # پارس کردن URL دیتابیس
+                import urllib.parse as urlparse
+                result = urlparse.urlparse(DATABASE_URL)
+                
+                # استخراج اطلاعات از URL
+                database = result.path[1:]
+                user = result.username
+                password = result.password
+                host = result.hostname
+                port = result.port
+                
+                self.conn = Connection(
+                    user=user,
+                    password=password,
+                    host=host,
+                    database=database,
+                    port=port,
+                    ssl=True
+                )
+                logger.info("✅ Connected to PostgreSQL Neon with pg8000")
+            else:
+                logger.error("❌ DATABASE_URL not found or pg8000 not available")
         except Exception as e:
             logger.error(f"❌ Error connecting to PostgreSQL: {e}")
-            raise e
     
     def execute(self, query, params=None, fetchone=False, fetchall=False):
+        """اجرای کوئری و بازگشت نتیجه"""
         try:
-            if not self.conn or self.conn.closed:
+            if not self.conn:
                 self._connect()
             
-            cursor = self.conn.cursor()
-            cursor.execute(query, params or ())
+            if params:
+                result = self.conn.run(query, *params)
+            else:
+                result = self.conn.run(query)
             
             if fetchone:
-                result = cursor.fetchone()
+                return result[0] if result else None
             elif fetchall:
-                result = cursor.fetchall()
+                return result
             else:
-                result = None
-                self.conn.commit()
-            
-            cursor.close()
-            return result
+                return None
             
         except Exception as e:
             logger.error(f"❌ Query error: {e} - Query: {query}")
-            if self.conn:
-                self.conn.rollback()
             return None
 
 pg_db = PostgresDB()
