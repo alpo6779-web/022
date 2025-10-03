@@ -3,14 +3,7 @@ import logging
 from datetime import datetime, timedelta
 import random
 import string
-
-try:
-    import pg8000
-    from pg8000.native import Connection, DatabaseError
-    PG8000_AVAILABLE = True
-except ImportError:
-    PG8000_AVAILABLE = False
-    logging.error("pg8000 not available, using SQLite fallback")
+import urllib.parse as urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -24,29 +17,26 @@ class PostgresDB:
     def _connect(self):
         """اتصال به PostgreSQL با pg8000"""
         try:
-            if DATABASE_URL and PG8000_AVAILABLE:
-                # پارس کردن URL دیتابیس
-                import urllib.parse as urlparse
+            if DATABASE_URL:
                 result = urlparse.urlparse(DATABASE_URL)
                 
-                # استخراج اطلاعات از URL
                 database = result.path[1:]
                 user = result.username
                 password = result.password
                 host = result.hostname
                 port = result.port
                 
-                self.conn = Connection(
+                import pg8000
+                self.conn = pg8000.connect(
                     user=user,
                     password=password,
                     host=host,
                     database=database,
-                    port=port,
-                    ssl=True
+                    port=port
                 )
-                logger.info("✅ Connected to PostgreSQL Neon with pg8000")
+                logger.info("✅ Connected to PostgreSQL Neon successfully")
             else:
-                logger.error("❌ DATABASE_URL not found or pg8000 not available")
+                logger.error("❌ DATABASE_URL not found")
         except Exception as e:
             logger.error(f"❌ Error connecting to PostgreSQL: {e}")
     
@@ -56,20 +46,24 @@ class PostgresDB:
             if not self.conn:
                 self._connect()
             
-            if params:
-                result = self.conn.run(query, *params)
-            else:
-                result = self.conn.run(query)
+            cursor = self.conn.cursor()
+            cursor.execute(query, params or ())
             
             if fetchone:
-                return result[0] if result else None
+                result = cursor.fetchone()
             elif fetchall:
-                return result
+                result = cursor.fetchall()
             else:
-                return None
+                result = None
+                self.conn.commit()
+            
+            cursor.close()
+            return result
             
         except Exception as e:
             logger.error(f"❌ Query error: {e} - Query: {query}")
+            if self.conn:
+                self.conn.rollback()
             return None
 
 pg_db = PostgresDB()
